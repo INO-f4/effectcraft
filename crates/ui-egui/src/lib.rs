@@ -1652,7 +1652,13 @@ impl EffectcraftApp {
                 self.playback.waiting_since = now;
             }
             let waited = now - self.playback.waiting_since;
-            a.speed(if waited < 0.25 { 0.85 } else if waited < 0.75 { 0.7 } else { 0.5 });
+            a.speed(if waited < 0.25 {
+                0.85
+            } else if waited < 0.75 {
+                0.7
+            } else {
+                0.5
+            });
             // The rate measured before the wait no longer says it keeps up.
             self.playback.shown_at.clear();
         }
