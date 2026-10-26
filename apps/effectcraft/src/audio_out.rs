@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -43,11 +43,17 @@ enum Cmd {
 }
 
 /// What the running stream shares with its owners: the feed its callback pulls from (swapped per
-/// playback) and the output latency it measures (device buffering, for A/V sync).
+/// playback), the output latency it measures (device buffering, for A/V sync), and whether the
+/// stream is still alive.
 #[derive(Default)]
 struct Shared {
     slot: Mutex<Option<Arc<AudioFeed>>>,
     latency: AtomicU64,
+    /// The session whose feed the callback serves (0: none). [`attach`] waits for it, so a `Play`
+    /// queued behind a dead stream's `Died` is caught instead of leaving a stalled preview.
+    bound: AtomicU64,
+    /// The stream reported an error: the output is rebuilt rather than reused.
+    dead: AtomicBool,
 }
 
 impl Shared {
@@ -64,11 +70,13 @@ impl Shared {
             Cmd::Play { session, feed } => {
                 *current = session;
                 *slot = Some(feed);
+                self.bound.store(session, Ordering::Release);
                 true
             }
             Cmd::Clear { session } => {
                 if session == *current {
                     *slot = None;
+                    self.bound.store(0, Ordering::Release);
                 }
                 true
             }
@@ -137,7 +145,10 @@ fn resolve_rate(out: &AudioOutput) -> Option<u32> {
 /// The running output when it matches `out` (nothing is touched when it doesn't): the rate it
 /// runs at, the shared state its callback pulls from, and where its commands go.
 fn running(out: &AudioOutput) -> Option<(u32, Arc<Shared>, mpsc::Sender<Cmd>)> {
-    output().as_ref().filter(|o| o.key == *out && !o.thread.is_finished()).map(|o| (o.rate, o.shared.clone(), o.tx.clone()))
+    output()
+        .as_ref()
+        .filter(|o| o.key == *out && !o.thread.is_finished() && !o.shared.dead.load(Ordering::Acquire))
+        .map(|o| (o.rate, o.shared.clone(), o.tx.clone()))
 }
 
 /// The output for `out`, building it first when none matches (the first use, after a change in
@@ -146,7 +157,7 @@ fn running(out: &AudioOutput) -> Option<(u32, Arc<Shared>, mpsc::Sender<Cmd>)> {
 /// Space would otherwise wait for.
 fn ensure(out: &AudioOutput, rate: u32) -> Result<(Arc<Shared>, mpsc::Sender<Cmd>), String> {
     let mut guard = output();
-    if guard.as_ref().is_some_and(|o| o.key != *out || o.thread.is_finished()) {
+    if guard.as_ref().is_some_and(|o| o.key != *out || o.thread.is_finished() || o.shared.dead.load(Ordering::Acquire)) {
         // End the old stream: its thread stops with this command (or already has, when the device
         // went away), whether or not a stale playback still holds a sender.
         if let Some(old) = guard.take() {
@@ -221,14 +232,15 @@ fn spawn_output(out: &AudioOutput, rate: u32) -> Result<Output, String> {
                     }
                 }
             };
-            let _ = ready_tx.send(Ok(()));
             // The stream runs from here for the rest of the process: with nothing bound its
             // callback pulls silence, so a playback's first samples are heard as soon as they are
-            // mixed (the device's buffer stays small for exactly that; #554).
+            // mixed (the device's buffer stays small for exactly that; #554). Reported ready only
+            // once it plays: a device that fails to start is an error here, not a later surprise.
             if let Err(e) = stream.play() {
-                log::warn!("audio output: {e}");
+                let _ = ready_tx.send(Err(e.to_string()));
                 return;
             }
+            let _ = ready_tx.send(Ok(()));
             let mut current = 0u64;
             while let Ok(cmd) = rx.recv() {
                 if !shared.serve(&mut current, cmd) {
@@ -257,6 +269,7 @@ fn run<T: SizedSample + FromSample<f32>>(
     let (left, right) = if map.0 < ch && map.1 < ch { map } else { (0, 1) };
     let rate = cfg.sample_rate.0 as f64;
     let mut stereo: Vec<f32> = Vec::new();
+    let alive = shared.clone();
     dev.build_output_stream(
         cfg,
         move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
@@ -288,6 +301,8 @@ fn run<T: SizedSample + FromSample<f32>>(
         },
         move |e| {
             log::warn!("audio output: {e}");
+            // Before the command, so an output that died is never attached again.
+            alive.dead.store(true, Ordering::Release);
             let _ = died.send(Cmd::Died);
         },
         None,
@@ -333,11 +348,44 @@ fn attach(out: &AudioOutput, rate: u32, feed: Arc<AudioFeed>) -> Result<((Arc<Sh
     for _ in 0..2 {
         let (shared, tx) = ensure(out, rate)?;
         let session = SESSION.fetch_add(1, Ordering::Relaxed) + 1;
-        if tx.send(Cmd::Play { session, feed: feed.clone() }).is_ok() {
+        if tx.send(Cmd::Play { session, feed: feed.clone() }).is_ok() && bound_within(&shared, session) {
             return Ok(((shared, tx), session));
         }
+        // The stream is going away: its `Died` was queued before this `Play`, or it was already
+        // dead when `ensure` looked. Stop it for good and build a new one, rather than leaving
+        // the preview with a clock that never advances.
+        shared.dead.store(true, Ordering::Release);
+        let _ = tx.send(Cmd::Died);
+        await_finished(out);
     }
     Err("the audio output went away".into())
+}
+
+/// Wait (bounded) until the callback serves `session`: the audio thread wakes on the command, so
+/// this is microseconds when the stream is alive.
+fn bound_within(shared: &Shared, session: u64) -> bool {
+    for _ in 0..100 {
+        if shared.bound.load(Ordering::Acquire) == session {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
+/// Wait (bounded) until the dead output's thread has finished, so the next [`ensure`] builds a new
+/// stream instead of racing the old one for the device.
+fn await_finished(out: &AudioOutput) {
+    for _ in 0..400 {
+        let finished = {
+            let guard = output();
+            guard.as_ref().is_none_or(|o| o.key != *out || o.thread.is_finished())
+        };
+        if finished {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 impl AudioDevice for CpalOut {
@@ -395,6 +443,7 @@ mod tests {
         let feed = Arc::new(AudioFeed::default());
         feed.push(&[0.1, 0.2]);
         assert!(s.serve(&mut current, Cmd::Play { session: 7, feed: feed.clone() }));
+        assert_eq!(s.bound.load(Ordering::Acquire), 7, "the callback reports the session it serves");
         let bound = s.feed().expect("the feed is bound");
         let mut out = [0.0f32; 2];
         bound.pull(&mut out);
@@ -408,6 +457,7 @@ mod tests {
         // Its own session clears it, and a dead stream stops serving.
         assert!(s.serve(&mut current, Cmd::Clear { session: 8 }));
         assert!(s.feed().is_none());
+        assert_eq!(s.bound.load(Ordering::Acquire), 0, "nothing is served after its own clear");
         assert!(!s.serve(&mut current, Cmd::Died));
     }
 }
