@@ -1440,6 +1440,9 @@ impl EffectcraftApp {
         self.playback.caching = false;
         self.playback.start_wall = now;
         self.playback.start_frame = pl.first;
+        // The cache may have taken seconds: the sound's resume watch starts from this moment, not
+        // from the press that began caching.
+        self.playback.last_shown = now;
         let t = self.session.active_comp().map(|c| c.frame_rate.tick_of(pl.first)).unwrap_or_default();
         self.start_audio(t);
         true
@@ -1573,6 +1576,8 @@ impl EffectcraftApp {
             self.playback.caching = false;
             self.playback.start_wall = now;
             self.playback.start_frame = p.first;
+            // The cache may have taken seconds: the sound's resume watch starts from this moment.
+            self.playback.last_shown = now;
             self.session.set_time(fr.tick_of(p.first));
             self.start_audio(fr.tick_of(p.first));
         }
@@ -1774,11 +1779,13 @@ impl EffectcraftApp {
                 self.playback.frame_shown(now);
             }
         } else {
-            // Not cached yet: hold the clock at the current frame (cache first, then play).
+            // Not cached yet: hold the clock at the current frame (cache first, then play). A frame
+            // the cache does have ahead is shown, so the sound's resume watch sees the picture move.
             self.playback.waiting = true;
             let next = plan.and_then(|p| p.frame_after(cur, 1)).unwrap_or(if cur + 1 > wb { wa } else { cur + 1 });
             if self.frames.is_cached(&FrameKey { frame: next, ..series }) {
                 self.session.set_time(fr.tick_of(next));
+                self.playback.frame_shown(now);
             }
             self.playback.start_wall = now;
             self.playback.start_frame = fr.frame_at(self.session.time());
