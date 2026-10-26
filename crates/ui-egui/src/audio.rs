@@ -324,7 +324,14 @@ pub struct AudioPlayback {
     feeder: Option<(RenderSource, ItemId, i64, u32)>,
     pub rate: u32,
     pub span: PlaySpan,
+    /// The clock's value the last time it was seen, and when it was seen (see
+    /// [`AudioPlayback::stalled`]).
+    last_clock: Mutex<(u64, Option<f64>)>,
 }
+
+/// How long the audio clock may stand still before the preview falls back to the frame clock
+/// (seconds): a stream that died, or a feeder that cannot keep up, must not freeze the preview.
+const AUDIO_STALL: f64 = 0.5;
 
 /// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
 /// wasm32 tops it up once per UI frame, so it keeps ~350 ms to ride out slow frames.
@@ -355,7 +362,16 @@ impl AudioPlayback {
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.
-            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix)), rate, span };
+            let mut p = AudioPlayback {
+                feed: feed.clone(),
+                device,
+                stop,
+                thread: None,
+                feeder: Some((src, comp, span.start, mix)),
+                rate,
+                span,
+                last_clock: Mutex::new((0, None)),
+            };
             p.device.start(feed)?;
             p.pump();
             return Ok(p);
@@ -382,7 +398,7 @@ impl AudioPlayback {
                 .map_err(|e| e.to_string())?
         };
         device.start(feed.clone())?;
-        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span })
+        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span, last_clock: Mutex::new((0, None)) })
     }
 
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
@@ -401,6 +417,20 @@ impl AudioPlayback {
     /// eases down and back up, so playback never falls silent and never repeats itself.
     pub fn speed(&self, speed: f32) {
         self.feed.set_speed(speed);
+    }
+
+    /// The audio clock has stood still for [`AUDIO_STALL`] seconds: the stream died or the feeder
+    /// cannot keep up. The preview falls back to the frame clock instead of freezing on it.
+    pub fn stalled(&self, now: f64) -> bool {
+        let Ok(mut l) = self.last_clock.lock() else { return false };
+        let c = self.feed.consumed();
+        match l.1 {
+            Some(t) if c == l.0 => now - t > AUDIO_STALL,
+            _ => {
+                *l = (c, Some(now));
+                false
+            }
+        }
     }
 
     /// The comp sample index audible now.

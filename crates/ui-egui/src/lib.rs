@@ -1630,6 +1630,14 @@ impl EffectcraftApp {
             self.stop();
             return true;
         }
+        if a.stalled(now) {
+            // The sound stopped: the stream died, or the feeder cannot keep up. Fall back to the
+            // frame clock from the frame on screen instead of freezing the preview (#947).
+            self.playback.start_wall = now;
+            self.playback.start_frame = cur;
+            self.audio = None;
+            return false;
+        }
         let snap = |f: i64| wa + (f - wa).div_euclid(step) * step;
         let target = snap(audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb));
         if !video {
