@@ -338,6 +338,8 @@ pub struct Playback {
     /// Frames shown / dropped (for the Info/Preview readout).
     pub shown: u64,
     pub waiting: bool,
+    /// When the wait for a frame began (seconds), while [`Playback::waiting`].
+    pub waiting_since: f64,
     pub fps: f64,
     /// The Preview panel shortcut that started this preview and what it plays.
     pub shortcut: effectcraft_engine::preview::PreviewShortcut,
@@ -353,11 +355,6 @@ pub struct Playback {
     pub restore_max: Option<Option<PanelKind>>,
     /// Audio-only previews: the frame under the audible sample (the current time stays put).
     pub audio_frame: Option<i64>,
-    /// The preview's sound waits for frames: while the frames ahead aren't cached, every frame
-    /// shows as it renders, silently; the sound starts once the rest of the preview (or what
-    /// fits in the RAM preview) is cached, so it never plays over skipped frames (#103), or
-    /// sooner once the silent preview keeps real time with the frames ahead cached (#208).
-    pub audio_held: bool,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -1291,6 +1288,7 @@ impl EffectcraftApp {
             start_frame: plan.first,
             shown: 0,
             waiting: false,
+            waiting_since: 0.0,
             fps: plan.fps,
             shortcut: sc,
             plan: Some(plan),
@@ -1300,15 +1298,14 @@ impl EffectcraftApp {
             layer_controls: preset.include_layer_controls,
             restore_max,
             audio_frame: (!plan.video).then_some(plan.first),
-            audio_held: false,
             shown_at: Default::default(),
         };
         if !self.playback.caching {
-            if plan.video {
-                self.playback.audio_held = self.audio_plays();
-            } else {
-                self.start_audio(fr.tick_of(plan.first));
-            }
+            // The sound starts with the first frame, at once (#947): the output is already open
+            // (the app opens it once per session), and waiting for frames to cache made the
+            // opening silent — or skipped it, when the sound started at the frame the playhead
+            // had reached. `start_audio` does nothing without audio or without a device.
+            self.start_audio(fr.tick_of(plan.first));
         }
     }
 
@@ -1492,8 +1489,6 @@ impl EffectcraftApp {
             self.cache_when_idle(ctx, &c, &series, now, input_active, (wa, wb));
             return;
         }
-        let fit = self.frames_that_fit(&c, scale);
-        self.start_held_audio(&pass, fit);
         if self.advance_audio_clock(&pass, step) {
             return;
         }
@@ -1617,22 +1612,6 @@ impl EffectcraftApp {
         }
     }
 
-    /// Held sound starts once the frames ahead are cached (see `Playback::audio_held`): the
-    /// prefetch window when the silent preview keeps real time, else the rest of the preview.
-    fn start_held_audio(&mut self, pass: &PlaybackPass<'_>, fit: i64) {
-        let PlaybackPass { now, plan, series, cur, ahead, frame_rate: fr, .. } = *pass;
-        if !self.playback.audio_held {
-            return;
-        }
-        let Some(p) = plan else { return };
-        if (self.playback.keeps_up(now) && self.cached_ahead(&p, &series, cur, ahead.min(fit))) || self.cached_ahead(&p, &series, cur, fit) {
-            self.playback.audio_held = false;
-            self.playback.start_wall = now;
-            self.playback.start_frame = cur;
-            self.start_audio(fr.tick_of(cur));
-        }
-    }
-
     /// Audio clock drives playback: show the frame under the audible sample. Returns true when
     /// the audio path handled this pass (including stopping at the end).
     fn advance_audio_clock(&mut self, pass: &PlaybackPass<'_>, step: i64) -> bool {
@@ -1653,26 +1632,30 @@ impl EffectcraftApp {
         if !video {
             self.playback.audio_frame = Some(target);
         } else if self.frames.is_cached(&FrameKey { frame: target, ..series }) {
+            // The picture caught up: the sound eases back to real time.
+            a.speed(1.0);
             self.playback.waiting = false;
             if target != cur {
                 self.session.set_time(fr.tick_of(target));
                 self.playback.frame_shown(now);
             }
         } else {
-            // Rendering can't keep up: rather than skip frames, the sound stops and every
-            // frame shows as it renders until the frames ahead are cached again.
-            self.audio = None;
-            self.playback.audio_held = true;
-            self.playback.waiting = true;
-            // The rate measured before the stall no longer says it keeps up.
+            // Rendering can't keep up: slow the sound (and the clock with it) so the picture gets
+            // time to render — playback eases down and back up instead of falling silent or
+            // repeating itself (#947, like a tape losing speed). The longer the wait, the slower
+            // it goes, but it never stops.
+            if !self.playback.waiting {
+                self.playback.waiting = true;
+                self.playback.waiting_since = now;
+            }
+            let waited = now - self.playback.waiting_since;
+            a.speed(if waited < 0.25 { 0.85 } else if waited < 0.75 { 0.7 } else { 0.5 });
+            // The rate measured before the wait no longer says it keeps up.
             self.playback.shown_at.clear();
-            self.playback.start_wall = now;
-            self.playback.start_frame = cur;
         }
         ctx.request_repaint();
         true
     }
-
     /// The wall clock advances the preview when no audio device drives it, and shows the target
     /// frame (or holds when it is not cached yet).
     fn advance_frame_clock(&mut self, pass: &PlaybackPass<'_>, step: i64) {
@@ -1797,11 +1780,6 @@ impl EffectcraftApp {
     /// at least one).
     /// The frames of `plan` from `cur` to its end, or as many as fit in the RAM preview, are
     /// cached: sound can play from `cur` in real time.
-    fn cached_ahead(&self, plan: &effectcraft_engine::preview::PreviewPlan, series: &FrameKey, cur: i64, fit: i64) -> bool {
-        let cached = self.frames.cached_frames(series);
-        (0..fit).map_while(|k| plan.frame_after(cur, k)).take_while(|f| *f >= cur).all(|f| cached.binary_search(&f).is_ok())
-    }
-
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
         let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
         let frame = side(comp.width) * side(comp.height) * 4.0;

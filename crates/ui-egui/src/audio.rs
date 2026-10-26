@@ -65,20 +65,73 @@ impl AudioOutput {
 }
 
 /// Lock-protected sample queue between the feeder thread and the device callback.
-#[derive(Default)]
 pub struct AudioFeed {
     queue: Mutex<VecDeque<f32>>,
-    /// Sample frames handed to the device (real audio only: underruns do not count).
+    /// Sample frames handed to the device (real audio only: underruns don't count).
     consumed: AtomicU64,
     /// Peak |sample| per channel since the last [`AudioFeed::take_peaks`] (f32 bits).
     peak: [AtomicU32; 2],
     /// The feeder reached the end of a non-looping span.
     finished: AtomicBool,
+    /// The rate the feed is pulled at (0: not told yet; speed easing is timed by it).
+    rate: AtomicU32,
+    /// How fast the sound is read: real time, or slower while the preview waits for a frame.
+    drive: Mutex<Drive>,
+}
+
+impl Default for AudioFeed {
+    fn default() -> Self {
+        AudioFeed {
+            queue: Mutex::default(),
+            consumed: AtomicU64::default(),
+            peak: [AtomicU32::new(0), AtomicU32::new(0)],
+            finished: AtomicBool::default(),
+            rate: AtomicU32::default(),
+            drive: Mutex::default(),
+        }
+    }
+}
+
+/// Slowest and fastest the sound is read at (a preview waiting for a frame slows it down).
+const MIN_SPEED: f32 = 0.25;
+const MAX_SPEED: f32 = 4.0;
+
+/// How [`AudioFeed::pull`] reads the queue: `speed` 1.0 is real time; below it playback slows
+/// down (varispeed: the pitch drops, as when a tape loses speed) and the clock with it, so a
+/// preview that waits for a frame neither falls silent nor repeats itself.
+struct Drive {
+    /// What the preview asks for (1.0, or less while it waits for a frame).
+    target: f32,
+    /// The speed the sound is read at: eased toward `target`, so a change is smooth.
+    speed: f32,
+    /// Position between `cur` and `nxt`, for reading at a fractional speed.
+    phase: f32,
+    /// The two source frames being read between, kept across blocks so no frame is lost.
+    cur: [f32; 2],
+    nxt: [f32; 2],
+    /// The last real frame read: a dry queue holds it instead of clicking to silence.
+    last: [f32; 2],
+    /// `cur` and `nxt` were filled (the first read after real time).
+    primed: bool,
+}
+
+impl Default for Drive {
+    fn default() -> Self {
+        Drive { target: 1.0, speed: 1.0, phase: 0.0, cur: [0.0; 2], nxt: [0.0; 2], last: [0.0; 2], primed: false }
+    }
 }
 
 impl AudioFeed {
     /// Fill `out` (interleaved stereo) from the queue; silence where the queue runs dry.
+    ///
+    /// While the preview asks for a speed below real time (see [`AudioFeed::set_speed`]) the
+    /// sound is read at that speed, interpolated between frames, and `consumed` counts only the
+    /// source frames actually taken: the preview's clock slows down with the sound, so a preview
+    /// waiting for a frame eases down and back up instead of falling silent or repeating.
     pub fn pull(&self, out: &mut [f32]) {
+        if self.varispeed(out) {
+            return;
+        }
         let mut real = 0usize;
         let mut pk = [0.0f32; 2];
         if let Ok(mut q) = self.queue.lock() {
@@ -91,6 +144,91 @@ impl AudioFeed {
         }
         out[real..].iter_mut().for_each(|o| *o = 0.0);
         self.consumed.fetch_add((real / 2) as u64, Ordering::Relaxed);
+        self.note_peaks(pk);
+    }
+
+    /// Read the queue at the eased speed when it is below real time (`true` when it did); at real
+    /// time [`AudioFeed::pull`] takes whole frames, exactly as they were mixed.
+    fn varispeed(&self, out: &mut [f32]) -> bool {
+        let Ok(mut d) = self.drive.lock() else { return false };
+        if d.target >= 1.0 && (d.speed - 1.0).abs() < 1e-3 {
+            d.speed = 1.0;
+            d.phase = 0.0;
+            d.primed = false;
+            return false;
+        }
+        let Ok(mut q) = self.queue.lock() else { return false };
+        let rate = self.rate.load(Ordering::Relaxed).max(8000) as f32;
+        // About 150 ms to cover most of the way to a new speed: a smooth ramp, no click.
+        let k = 1.0 / (0.15 * rate);
+        let mut taken = 0u64;
+        let next = |q: &mut VecDeque<f32>, last: &mut [f32; 2], taken: &mut u64| match (q.pop_front(), q.pop_front()) {
+            (Some(l), Some(r)) => {
+                *last = [l, r];
+                *taken += 1;
+                [l, r]
+            }
+            // Past the queue's end: hold the last frame (silence before the first one), and
+            // count nothing, so a dry queue never moves the clock.
+            _ => *last,
+        };
+        let mut last = d.last;
+        let mut cur = d.cur;
+        let mut nxt = d.nxt;
+        if !d.primed {
+            cur = next(&mut q, &mut last, &mut taken);
+            nxt = next(&mut q, &mut last, &mut taken);
+            d.primed = true;
+        }
+        let mut pk = [0.0f32; 2];
+        for f in out.chunks_mut(2) {
+            d.speed += (d.target - d.speed) * k;
+            let speed = d.speed.clamp(MIN_SPEED, MAX_SPEED);
+            let p = d.phase;
+            let l = cur[0] + (nxt[0] - cur[0]) * p;
+            let r = cur[1] + (nxt[1] - cur[1]) * p;
+            f[0] = l;
+            if f.len() > 1 {
+                f[1] = r;
+            }
+            pk[0] = pk[0].max(l.abs());
+            pk[1] = pk[1].max(r.abs());
+            d.phase += speed;
+            while d.phase >= 1.0 {
+                d.phase -= 1.0;
+                cur = nxt;
+                nxt = next(&mut q, &mut last, &mut taken);
+            }
+        }
+        d.last = last;
+        d.cur = cur;
+        d.nxt = nxt;
+        self.consumed.fetch_add(taken, Ordering::Relaxed);
+        drop(q);
+        drop(d);
+        self.note_peaks(pk);
+        true
+    }
+
+    /// Play at `speed` (1.0 = real time): a preview that waits for a frame asks for less, and the
+    /// sound eases down to it and back up, so playback slows smoothly instead of falling silent.
+    pub fn set_speed(&self, speed: f32) {
+        if let Ok(mut d) = self.drive.lock() {
+            d.target = speed.clamp(MIN_SPEED, MAX_SPEED);
+        }
+    }
+
+    /// The speed the sound is being read at (eased toward the one last set).
+    pub fn speed(&self) -> f32 {
+        self.drive.lock().map(|d| d.speed).unwrap_or(1.0)
+    }
+
+    /// The rate the feed is pulled at: a change of speed is eased over about 150 ms of it.
+    pub fn set_rate(&self, rate: u32) {
+        self.rate.store(rate, Ordering::Relaxed);
+    }
+
+    fn note_peaks(&self, pk: [f32; 2]) {
         for (c, v) in pk.into_iter().enumerate() {
             // Rust 1.99 renamed `fetch_update` to `try_update`; keep the old name while the
             // workspace supports Rust 1.95 (`rust-version`).
@@ -210,6 +348,7 @@ impl AudioPlayback {
         let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
         let span = PlaySpan::new(start, wa, wb, looping, rate);
         let feed = Arc::new(AudioFeed::default());
+        feed.set_rate(rate);
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.
@@ -253,6 +392,12 @@ impl AudioPlayback {
             }
         }
         self.device.pump();
+    }
+
+    /// Slow the sound (and the clock with it) while the picture waits for a frame: the pitch
+    /// eases down and back up, so playback never falls silent and never repeats itself.
+    pub fn speed(&self, speed: f32) {
+        self.feed.set_speed(speed);
     }
 
     /// The comp sample index audible now.
@@ -483,6 +628,32 @@ mod tests {
         assert_eq!(f.consumed(), 2);
         assert_eq!(f.take_peaks(), [0.5, 0.9]);
         assert_eq!(f.take_peaks(), [0.0, 0.0]);
+    }
+
+    /// A preview that waits for a frame slows the sound down (#947): it is still there, it just
+    /// takes fewer source frames per output frame, and the clock (consumed) slows with it.
+    #[test]
+    fn a_slow_speed_reads_between_frames_and_slows_the_clock() {
+        let f = AudioFeed::default();
+        f.set_rate(48_000);
+        // A steady level: nothing is silent, and every output sample should be the same.
+        f.push(&vec![0.5f32; 400_000]);
+        let mut out = vec![0.0f32; 4800];
+        f.pull(&mut out);
+        assert_eq!(f.consumed(), 2400, "real time takes whole frames");
+        // Slowed down: the same tenth of a second of output takes fewer source frames.
+        f.set_speed(0.5);
+        f.pull(&mut out);
+        let slow = f.consumed() - 2400;
+        assert!(slow > 0 && slow < 2400, "a slowed read took {slow} of 2400 frames");
+        assert!(f.speed() < 1.0, "the speed eases down: {}", f.speed());
+        assert!(out.iter().all(|v| (*v - 0.5).abs() < 1e-6), "the sound is still there, not silence");
+        // Back to real time: the speed eases up again.
+        f.set_speed(1.0);
+        for _ in 0..40 {
+            f.pull(&mut out);
+        }
+        assert!((f.speed() - 1.0).abs() < 0.01, "the speed came back: {}", f.speed());
     }
 
     /// #408: starting a preview with sound returns at once even when reading the footage takes
