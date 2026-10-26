@@ -1656,10 +1656,13 @@ impl EffectcraftApp {
                 self.playback.frame_shown(now);
             }
         } else {
-            // Rendering can't keep up: slow the sound (and the clock with it) so the picture gets
-            // time to render — playback eases down and back up instead of falling silent or
-            // repeating itself (#947, like a tape losing speed). The longer the wait, the slower
-            // it goes, but it never stops.
+            // The frame under the audible sample is not rendered yet. Ask for it here: the clock can
+            // run past the prefetch window (a loop wrap, a speed change, a stall), and a frame
+            // nobody requests is a frame nobody renders. Then slow the sound (and the clock with
+            // it) so the picture gets time to render — playback eases down and back up instead of
+            // falling silent or repeating itself (#947, like a tape losing speed). The longer the
+            // wait, the slower it goes, but it never stops.
+            self.request_frame_urgent(pass.cid, target, pass.scale);
             if !self.playback.waiting {
                 self.playback.waiting = true;
                 self.playback.waiting_since = now;
