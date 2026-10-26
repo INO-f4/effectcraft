@@ -70,6 +70,12 @@ const EDIT_QUIET: f64 = 0.3;
 /// hides what the render is doing (#2472).
 const AUDIO_GIVE_UP: f64 = 1.5;
 
+/// A preview whose sound was given up takes it up again once the picture has moved within this
+/// long (seconds), and no sooner than this long after giving it up — a preview that cannot keep
+/// up must not thrash between the two paths.
+const RESUME_QUIET: f64 = 0.5;
+const RESUME_COOLDOWN: f64 = 1.0;
+
 /// The application's monotonic clock, in seconds.
 ///
 /// Neither `ctx.input(|i| i.time)` nor `RawInput::time` is valid in a logic-only tick:
@@ -363,6 +369,9 @@ pub struct Playback {
     /// When a frame last went on screen (seconds): a preview that shows none for a while gives up
     /// on the sound rather than play on over a still picture.
     pub last_shown: f64,
+    /// When the sound was given up last (seconds; 0 when it was not), so it can be taken up again
+    /// once the picture moves, without thrashing.
+    pub gave_up_at: f64,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -1309,6 +1318,7 @@ impl EffectcraftApp {
             restore_max,
             audio_frame: (!plan.video).then_some(plan.first),
             last_shown: now,
+            gave_up_at: 0.0,
             shown_at: Default::default(),
         };
         if !self.playback.caching {
@@ -1649,6 +1659,7 @@ impl EffectcraftApp {
             let at = if video { cur } else { self.playback.audio_frame.unwrap_or(cur) };
             self.playback.start_wall = now;
             self.playback.start_frame = at;
+            self.playback.gave_up_at = now;
             if let Some(mut a) = self.audio.take() {
                 a.stop_async();
             }
@@ -1699,7 +1710,27 @@ impl EffectcraftApp {
     }
     /// The wall clock advances the preview when no audio device drives it, and shows the target
     /// frame (or holds when it is not cached yet).
+    /// Take the sound up again after [`EffectcraftApp::advance_audio_clock`] gave it up, once the
+    /// picture is moving again (a frame shown lately), no sooner than [`RESUME_COOLDOWN`].
+    fn resume_audio(&mut self, pass: &PlaybackPass<'_>) {
+        if self.audio.is_some() || !self.playback.playing || self.playback.caching || !self.audio_plays() {
+            return;
+        }
+        let PlaybackPass { now, frame_rate: fr, cur, .. } = *pass;
+        if now - self.playback.last_shown > RESUME_QUIET || now - self.playback.gave_up_at < RESUME_COOLDOWN {
+            return;
+        }
+        // Each attempt restarts the cooldown, so a preview that cannot keep up tries again at most
+        // once a second instead of every frame.
+        self.playback.gave_up_at = now;
+        self.start_audio(fr.tick_of(cur));
+    }
+
     fn advance_frame_clock(&mut self, pass: &PlaybackPass<'_>, step: i64) {
+        // The sound was given up earlier (a stall, a stream that died, a render too slow): take it
+        // up again from the frame on screen once the picture moves, or a preview that stalled once
+        // would stay silent for the rest of the pass (#947).
+        self.resume_audio(pass);
         let PlaybackPass { ctx, now, plan, video, looping, frame_rate: fr, cur, series, .. } = *pass;
         let FrameWindow { first: wa, last: wb } = pass.window;
         let elapsed = now - self.playback.start_wall;
