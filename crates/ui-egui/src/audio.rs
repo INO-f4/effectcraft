@@ -424,10 +424,10 @@ impl AudioPlayback {
                 .map_err(|e| e.to_string())?
         };
         if let Err(e) = device.start(feed.clone()) {
-            // The feeder has nothing to feed: stop it here, or it runs on for the rest of the
-            // session holding the render source.
+            // The feeder has nothing to feed: signal it and let it leave at its next stop check.
+            // Joining here would wait for a slow mix on the UI thread that starts the preview.
             stop.store(true, Ordering::Relaxed);
-            let _ = thread.join();
+            drop(thread);
             return Err(e);
         }
         Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span, last_clock: Mutex::new(Watch::default()) })
