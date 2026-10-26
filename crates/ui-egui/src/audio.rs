@@ -324,9 +324,17 @@ pub struct AudioPlayback {
     feeder: Option<(RenderSource, ItemId, i64, u32)>,
     pub rate: u32,
     pub span: PlaySpan,
-    /// The clock's value the last time it was seen, and when it was seen (see
-    /// [`AudioPlayback::stalled`]).
-    last_clock: Mutex<(u64, Option<f64>)>,
+    /// The clock the stall watch last saw (see [`AudioPlayback::stalled`]).
+    last_clock: Mutex<Watch>,
+}
+
+/// What the stall watch last saw: the clock's value, when it was seen, and whether the feed had
+/// samples queued then (a feeder filling an empty queue is not a stalled device).
+#[derive(Default)]
+struct Watch {
+    consumed: u64,
+    at: Option<f64>,
+    queued: bool,
 }
 
 /// How long a stream may leave queued samples unpulled before the preview falls back to the frame
@@ -337,6 +345,19 @@ const AUDIO_STALL: f64 = 0.5;
 /// Mixing the first block can take seconds (a long FLAC decodes whole, #408), and that is not a
 /// dead stream: give it room before giving up on the sound.
 const AUDIO_STARVE: f64 = 5.0;
+
+/// The stall watch: `true` once the clock has stood still long enough to give up on the sound.
+/// The watch starts again whenever the queue gains its first samples (the device had nothing to
+/// play before that, so a feeder's slow first block is not a stall, #408) and whenever the clock
+/// moves; a stream with samples queued that it does not pull is dead after [`AUDIO_STALL`].
+fn stall_watch(w: &mut Watch, now: f64, consumed: u64, queued: bool) -> bool {
+    let moved = consumed != w.consumed || queued != w.queued;
+    let Some(since) = w.at.filter(|_| !moved) else {
+        *w = Watch { consumed, at: Some(now), queued };
+        return false;
+    };
+    now - since > if queued { AUDIO_STALL } else { AUDIO_STARVE }
+}
 
 /// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
 /// wasm32 tops it up once per UI frame, so it keeps ~350 ms to ride out slow frames.
@@ -375,7 +396,7 @@ impl AudioPlayback {
                 feeder: Some((src, comp, span.start, mix)),
                 rate,
                 span,
-                last_clock: Mutex::new((0, None)),
+                last_clock: Mutex::new(Watch::default()),
             };
             p.device.start(feed)?;
             p.pump();
@@ -409,7 +430,7 @@ impl AudioPlayback {
             let _ = thread.join();
             return Err(e);
         }
-        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span, last_clock: Mutex::new((0, None)) })
+        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span, last_clock: Mutex::new(Watch::default()) })
     }
 
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
@@ -435,15 +456,8 @@ impl AudioPlayback {
     /// queued samples unpulled is dead after [`AUDIO_STALL`]; one with nothing queued is still
     /// waiting for its feeder, which may be decoding a long file ([`AUDIO_STARVE`], #408).
     pub fn stalled(&self, now: f64) -> bool {
-        let Ok(mut l) = self.last_clock.lock() else { return false };
-        let c = self.feed.consumed();
-        match l.1 {
-            Some(t) if c == l.0 => now - t > if self.feed.queued_frames() > 0 { AUDIO_STALL } else { AUDIO_STARVE },
-            _ => {
-                *l = (c, Some(now));
-                false
-            }
-        }
+        let Ok(mut w) = self.last_clock.lock() else { return false };
+        stall_watch(&mut w, now, self.feed.consumed(), self.feed.queued_frames() > 0)
     }
 
     /// The comp sample index audible now.
@@ -683,6 +697,26 @@ mod tests {
         assert_eq!(f.consumed(), 2);
         assert_eq!(f.take_peaks(), [0.5, 0.9]);
         assert_eq!(f.take_peaks(), [0.0, 0.0]);
+    }
+
+    /// A slow first block is not a stall: the short watch starts when the queue gains samples,
+    /// not when the feeder begins mixing (#408).
+    #[test]
+    fn the_stall_watch_ignores_a_slow_first_block() {
+        let mut w = Watch::default();
+        assert!(!stall_watch(&mut w, 0.0, 0, false), "the watch starts");
+        assert!(!stall_watch(&mut w, 2.0, 0, false), "the feeder is still mixing");
+        // The first block lands: the device finally has something to play, so the 0.5 s watch
+        // starts here rather than 2 s ago.
+        assert!(!stall_watch(&mut w, 2.0, 0, true), "a queue with samples is not a stall yet");
+        assert!(!stall_watch(&mut w, 2.2, 0, true), "the device had 200 ms to pull");
+        assert!(stall_watch(&mut w, 2.6, 0, true), "queued samples that are not pulled: dead");
+        // Nothing queued again: only the long feeder watch applies.
+        assert!(!stall_watch(&mut w, 3.0, 0, false));
+        assert!(!stall_watch(&mut w, 7.0, 0, false), "4 s: still inside the feeder's window");
+        assert!(stall_watch(&mut w, 8.2, 0, false), "5.2 s with nothing to play: stalled");
+        // The clock moving keeps it alive at any speed.
+        assert!(!stall_watch(&mut w, 8.3, 1600, false));
     }
 
     /// A preview that waits for a frame slows the sound down (#947): it is still there, it just
