@@ -300,10 +300,16 @@ fn run<T: SizedSample + FromSample<f32>>(
             shared.latency.store((dev_lat * rate) as u64 + frames as u64, Ordering::Relaxed);
         },
         move |e| {
+            // ALSA and PulseAudio report recoverable polling and xrun errors here, and the worker
+            // goes on: only a device that is gone ends the stream. A stall a platform reports as
+            // something else is caught by `AudioPlayback::stalled`, which hands the preview back to
+            // the frame clock, and the next playback rebuilds an output whose `Play` never lands.
+            if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                // Before the command, so an output that died is never attached again.
+                alive.dead.store(true, Ordering::Release);
+                let _ = died.send(Cmd::Died);
+            }
             log::warn!("audio output: {e}");
-            // Before the command, so an output that died is never attached again.
-            alive.dead.store(true, Ordering::Release);
-            let _ = died.send(Cmd::Died);
         },
         None,
     )
