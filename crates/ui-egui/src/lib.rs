@@ -1721,14 +1721,22 @@ impl EffectcraftApp {
         if self.audio.is_some() || !self.playback.playing || self.playback.caching || !self.audio_plays() {
             return;
         }
-        let PlaybackPass { now, frame_rate: fr, cur, .. } = *pass;
-        if now - self.playback.last_shown > RESUME_QUIET || now - self.playback.gave_up_at < RESUME_COOLDOWN {
+        let PlaybackPass { now, frame_rate: fr, cur, video, .. } = *pass;
+        if now - self.playback.gave_up_at < RESUME_COOLDOWN {
+            return;
+        }
+        // An audio-only preview shows no frames, so "the picture moved lately" says nothing there:
+        // only a preview with video waits for one.
+        if video && now - self.playback.last_shown > RESUME_QUIET {
             return;
         }
         // Each attempt restarts the cooldown, so a preview that cannot keep up tries again at most
         // once a second instead of every frame.
         self.playback.gave_up_at = now;
-        self.start_audio(fr.tick_of(cur));
+        // Resume where the sound stopped: the frame on screen for a preview with video, and the
+        // audible frame for an audio-only one (its session time never moves).
+        let at = if video { cur } else { self.playback.audio_frame.unwrap_or(cur) };
+        self.start_audio(fr.tick_of(at));
     }
 
     fn advance_frame_clock(&mut self, pass: &PlaybackPass<'_>, step: i64) {
