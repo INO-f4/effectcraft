@@ -65,6 +65,11 @@ const MAX_SHOT_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 /// [`EffectcraftApp::editing`]).
 const EDIT_QUIET: f64 = 0.3;
 
+/// How long a preview with sound may show no new frame before it gives the sound up (seconds):
+/// past the slowest speed there is nothing left to slow, and playing on over a still frame only
+/// hides what the render is doing (#2472).
+const AUDIO_GIVE_UP: f64 = 1.5;
+
 /// The application's monotonic clock, in seconds.
 ///
 /// Neither `ctx.input(|i| i.time)` nor `RawInput::time` is valid in a logic-only tick:
@@ -355,6 +360,9 @@ pub struct Playback {
     pub restore_max: Option<Option<PanelKind>>,
     /// Audio-only previews: the frame under the audible sample (the current time stays put).
     pub audio_frame: Option<i64>,
+    /// When a frame last went on screen (seconds): a preview that shows none for a while gives up
+    /// on the sound rather than play on over a still picture.
+    pub last_shown: f64,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -363,6 +371,7 @@ impl Playback {
     /// A new frame went on screen at `now`.
     pub fn frame_shown(&mut self, now: f64) {
         self.shown += 1;
+        self.last_shown = now;
         self.shown_at.push_back(now);
         while self.shown_at.front().is_some_and(|t| now - t > 1.0) {
             self.shown_at.pop_front();
@@ -1299,6 +1308,7 @@ impl EffectcraftApp {
             layer_controls: preset.include_layer_controls,
             restore_max,
             audio_frame: (!plan.video).then_some(plan.first),
+            last_shown: now,
             shown_at: Default::default(),
         };
         if !self.playback.caching {
@@ -1630,9 +1640,10 @@ impl EffectcraftApp {
             self.stop();
             return true;
         }
-        if a.stalled(now) {
-            // The sound stopped: the stream died, or the feeder cannot keep up. Fall back to the
-            // frame clock from where playback is, instead of freezing the preview (#947). An
+        if a.stalled(now) || (video && now - self.playback.last_shown > AUDIO_GIVE_UP) {
+            // The sound stopped, or the picture has not moved for a while (the renderer cannot keep
+            // up even at the slowest speed): fall back to the frame clock from where playback is,
+            // instead of freezing the preview or playing on over a still frame (#947). An
             // audio-only preview leaves the session time put, so its progress is `audio_frame`.
             // The feeder may still be mixing a slow file: stop it without waiting for it.
             let at = if video { cur } else { self.playback.audio_frame.unwrap_or(cur) };
