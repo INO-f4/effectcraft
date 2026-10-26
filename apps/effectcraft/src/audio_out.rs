@@ -336,6 +336,11 @@ pub fn open(out: &AudioOutput) -> Option<Box<dyn AudioDevice>> {
 /// enumerated and the stream built now, so the first press doesn't wait for it. Fails without a
 /// device; the first preview then opens it as before.
 pub fn prewarm(out: &AudioOutput) -> Result<(), String> {
+    // Warm up only when nothing runs yet: an output that already exists (a preview started first,
+    // perhaps with newer settings) is left alone. A late warm-up must never replace it.
+    if output().is_some() {
+        return Ok(());
+    }
     let rate = resolve_rate(out).ok_or("no audio output device")?;
     ensure(out, rate).map(|_| ())
 }
