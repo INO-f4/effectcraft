@@ -360,10 +360,11 @@ fn stall_watch(w: &mut Watch, now: f64, consumed: u64, queued: bool) -> bool {
     now - since > if queued { AUDIO_STALL } else { AUDIO_STARVE }
 }
 
-/// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
-/// wasm32 tops it up once per UI frame, so it keeps ~350 ms to ride out slow frames.
+/// Audio kept queued ahead of the device: ~100 ms (a feeder thread tops it up continuously), so a
+/// preview that restarts its sound repeats as little of the queue as the device needs; wasm32
+/// tops it up once per UI frame, so it keeps ~350 ms to ride out slow frames.
 fn queue_target(rate: u32) -> usize {
-    if cfg!(target_arch = "wasm32") { rate as usize * 7 / 20 } else { rate as usize / 5 }
+    if cfg!(target_arch = "wasm32") { rate as usize * 7 / 20 } else { rate as usize / 10 }
 }
 
 impl AudioPlayback {
