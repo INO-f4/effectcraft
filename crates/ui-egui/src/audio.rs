@@ -402,7 +402,13 @@ impl AudioPlayback {
                 })
                 .map_err(|e| e.to_string())?
         };
-        device.start(feed.clone())?;
+        if let Err(e) = device.start(feed.clone()) {
+            // The feeder has nothing to feed: stop it here, or it runs on for the rest of the
+            // session holding the render source.
+            stop.store(true, Ordering::Relaxed);
+            let _ = thread.join();
+            return Err(e);
+        }
         Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span, last_clock: Mutex::new((0, None)) })
     }
 
@@ -455,6 +461,15 @@ impl AudioPlayback {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+
+    /// Stop without waiting for the feeder: the stall fallback runs on the UI thread while the
+    /// feeder may still be mixing a slow file, and blocking there is what the fallback avoids. The
+    /// thread leaves at its next stop check; dropping its handle lets it finish on its own.
+    pub fn stop_async(&mut self) {
+        self.device.stop();
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.take();
     }
 }
 

@@ -1632,10 +1632,13 @@ impl EffectcraftApp {
         }
         if a.stalled(now) {
             // The sound stopped: the stream died, or the feeder cannot keep up. Fall back to the
-            // frame clock from the frame on screen instead of freezing the preview (#947).
+            // frame clock from the frame on screen instead of freezing the preview (#947). The
+            // feeder may still be mixing a slow file: stop it without waiting for it.
             self.playback.start_wall = now;
             self.playback.start_frame = cur;
-            self.audio = None;
+            if let Some(mut a) = self.audio.take() {
+                a.stop_async();
+            }
             return false;
         }
         let snap = |f: i64| wa + (f - wa).div_euclid(step) * step;
