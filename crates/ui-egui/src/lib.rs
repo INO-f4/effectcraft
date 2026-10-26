@@ -1662,7 +1662,12 @@ impl EffectcraftApp {
             // it) so the picture gets time to render — playback eases down and back up instead of
             // falling silent or repeating itself (#947, like a tape losing speed). The longer the
             // wait, the slower it goes, but it never stops.
-            self.request_frame_urgent(pass.cid, target, pass.scale);
+            // Ask for the frame under the audible sample, but only when nothing urgent is in
+            // flight: a new urgent request cancels the previous one for this comp, so asking every
+            // frame would cancel every render and leave the picture on an old frame.
+            if !self.frames.urgent_pending() {
+                self.request_frame_urgent(pass.cid, target, pass.scale);
+            }
             if !self.playback.waiting {
                 self.playback.waiting = true;
                 self.playback.waiting_since = now;
