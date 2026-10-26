@@ -329,9 +329,14 @@ pub struct AudioPlayback {
     last_clock: Mutex<(u64, Option<f64>)>,
 }
 
-/// How long the audio clock may stand still before the preview falls back to the frame clock
-/// (seconds): a stream that died, or a feeder that cannot keep up, must not freeze the preview.
+/// How long a stream may leave queued samples unpulled before the preview falls back to the frame
+/// clock (seconds): a dead device must not freeze the preview.
 const AUDIO_STALL: f64 = 0.5;
+
+/// How long the preview waits for samples from a feeder that has nothing queued yet (seconds).
+/// Mixing the first block can take seconds (a long FLAC decodes whole, #408), and that is not a
+/// dead stream: give it room before giving up on the sound.
+const AUDIO_STARVE: f64 = 5.0;
 
 /// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
 /// wasm32 tops it up once per UI frame, so it keeps ~350 ms to ride out slow frames.
@@ -419,13 +424,15 @@ impl AudioPlayback {
         self.feed.set_speed(speed);
     }
 
-    /// The audio clock has stood still for [`AUDIO_STALL`] seconds: the stream died or the feeder
-    /// cannot keep up. The preview falls back to the frame clock instead of freezing on it.
+    /// The audio clock has stood still: the stream is dead, or the feeder has nothing to give it.
+    /// The preview falls back to the frame clock instead of freezing on it. A stream that leaves
+    /// queued samples unpulled is dead after [`AUDIO_STALL`]; one with nothing queued is still
+    /// waiting for its feeder, which may be decoding a long file ([`AUDIO_STARVE`], #408).
     pub fn stalled(&self, now: f64) -> bool {
         let Ok(mut l) = self.last_clock.lock() else { return false };
         let c = self.feed.consumed();
         match l.1 {
-            Some(t) if c == l.0 => now - t > AUDIO_STALL,
+            Some(t) if c == l.0 => now - t > if self.feed.queued_frames() > 0 { AUDIO_STALL } else { AUDIO_STARVE },
             _ => {
                 *l = (c, Some(now));
                 false
