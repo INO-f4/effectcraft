@@ -156,7 +156,9 @@ fn ensure(out: &AudioOutput, rate: u32) -> Result<(Arc<Shared>, mpsc::Sender<Cmd
     if guard.is_none() {
         *guard = Some(spawn_output(out, rate)?);
     }
-    let o = guard.as_ref().expect("the output was just built");
+    let Some(o) = guard.as_ref() else {
+        return Err("the audio output could not be opened".into());
+    };
     Ok((o.shared.clone(), o.tx.clone()))
 }
 
