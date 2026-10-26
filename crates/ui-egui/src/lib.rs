@@ -1261,6 +1261,7 @@ impl EffectcraftApp {
 
     // ---------------------------------------------------------------- playback
 
+    /// Start the preview of the current preview shortcut (Space, or the panel's choice).
     pub fn play(&mut self, now: f64) {
         let sc = self.session.prefs.preview.current;
         self.play_with(now, sc);
@@ -1358,6 +1359,7 @@ impl EffectcraftApp {
         }
     }
 
+    /// Stop the preview, leaving the playhead where the preview's Move Time To Preview Time says.
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.audio = None;
@@ -1380,6 +1382,7 @@ impl EffectcraftApp {
         }
     }
 
+    /// Play the current preview, or stop the running one.
     pub fn toggle_play(&mut self, now: f64) {
         let sc = self.session.prefs.preview.current;
         self.toggle_play_with(now, sc);

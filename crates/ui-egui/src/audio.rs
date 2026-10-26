@@ -80,6 +80,7 @@ pub struct AudioFeed {
 }
 
 impl Default for AudioFeed {
+    /// An idle feed: nothing queued, nothing bound, real time.
     fn default() -> Self {
         AudioFeed {
             queue: Mutex::default(),
@@ -116,6 +117,7 @@ struct Drive {
 }
 
 impl Default for Drive {
+    /// Real time, with nothing to interpolate.
     fn default() -> Self {
         Drive { target: 1.0, speed: 1.0, phase: 0.0, cur: [0.0; 2], nxt: [0.0; 2], last: [0.0; 2], primed: false }
     }
@@ -228,6 +230,7 @@ impl AudioFeed {
         self.rate.store(rate, Ordering::Relaxed);
     }
 
+    /// Raise the peak meters with the samples just produced.
     fn note_peaks(&self, pk: [f32; 2]) {
         for (c, v) in pk.into_iter().enumerate() {
             // Rust 1.99 renamed `fetch_update` to `try_update`; keep the old name while the

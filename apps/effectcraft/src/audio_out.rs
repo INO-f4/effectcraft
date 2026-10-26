@@ -242,6 +242,9 @@ fn spawn_output(out: &AudioOutput, rate: u32) -> Result<Output, String> {
     Ok(Output { key: out.clone(), rate, shared: shared_out, tx, thread })
 }
 
+/// Build `dev`'s stream: the callback pulls the bound feed (silence when none is bound), maps
+/// it onto the device's channels and records the output latency; an error reports the stream
+/// dead over `died`.
 fn run<T: SizedSample + FromSample<f32>>(
     dev: &cpal::Device,
     cfg: &cpal::StreamConfig,
@@ -338,10 +341,12 @@ fn attach(out: &AudioOutput, rate: u32, feed: Arc<AudioFeed>) -> Result<((Arc<Sh
 }
 
 impl AudioDevice for CpalOut {
+    /// The rate the process output was opened at.
     fn sample_rate(&self) -> u32 {
         self.rate
     }
 
+    /// Bind `feed` to the process output (building it first when none matches).
     fn start(&mut self, feed: Arc<AudioFeed>) -> Result<(), String> {
         self.stop();
         let ((shared, tx), session) = attach(&self.out, self.rate, feed)?;
@@ -350,18 +355,21 @@ impl AudioDevice for CpalOut {
         Ok(())
     }
 
+    /// Unbind this playback's feed; the stream stays open and pulls silence.
     fn stop(&mut self) {
         if let Some((_, tx)) = self.running.take() {
             let _ = tx.send(Cmd::Clear { session: self.session });
         }
     }
 
+    /// The output latency the callback measured (0 until it has run).
     fn latency_frames(&self) -> u64 {
         self.running.as_ref().map(|(s, _)| s.latency.load(Ordering::Relaxed)).unwrap_or(0)
     }
 }
 
 impl Drop for CpalOut {
+    /// Unbind the feed; the process output itself outlives every playback.
     fn drop(&mut self) {
         self.stop();
     }
@@ -371,6 +379,7 @@ impl Drop for CpalOut {
 mod tests {
     use super::*;
 
+    /// The Linux period stays about 10 ms across rates.
     #[test]
     fn preferred_buffer_is_about_ten_milliseconds() {
         assert_eq!(preferred_buffer_frames(48_000), 480);
@@ -378,6 +387,7 @@ mod tests {
         assert_eq!(preferred_buffer_frames(192_000), 1920);
     }
 
+    /// A playback binds its feed, and only its own session unbinds it.
     #[test]
     fn a_play_binds_its_feed_until_its_session_clears() {
         let s = Shared::default();
