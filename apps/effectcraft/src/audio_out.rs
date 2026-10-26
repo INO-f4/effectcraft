@@ -342,13 +342,22 @@ pub fn open(out: &AudioOutput) -> Option<Box<dyn AudioDevice>> {
 /// enumerated and the stream built now, so the first press doesn't wait for it. Fails without a
 /// device; the first preview then opens it as before.
 pub fn prewarm(out: &AudioOutput) -> Result<(), String> {
+    let rate = resolve_rate(out).ok_or("no audio output device")?;
     // Warm up only when nothing runs yet: an output that already exists (a preview started first,
-    // perhaps with newer settings) is left alone. A late warm-up must never replace it.
-    if output().is_some() {
+    // perhaps with newer settings) is left alone, and checking and building under one lock means
+    // a preview cannot slip in between and have its stream replaced by this one.
+    warm_up(out, rate)
+}
+
+/// Build the process output for `out` when none exists, under [`OUTPUT`]'s lock.
+fn warm_up(out: &AudioOutput, rate: u32) -> Result<(), String> {
+    let mut guard = output();
+    if guard.is_some() {
         return Ok(());
     }
-    let rate = resolve_rate(out).ok_or("no audio output device")?;
-    ensure(out, rate).map(|_| ())
+    let built = spawn_output(out, rate)?;
+    *guard = Some(built);
+    Ok(())
 }
 
 /// Bind `feed` to the process's output for `out` (building the output first when none matches),

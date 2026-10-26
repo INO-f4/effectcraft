@@ -153,10 +153,11 @@ impl AudioFeed {
     /// time [`AudioFeed::pull`] takes whole frames, exactly as they were mixed.
     fn varispeed(&self, out: &mut [f32]) -> bool {
         let Ok(mut d) = self.drive.lock() else { return false };
-        if d.target >= 1.0 && (d.speed - 1.0).abs() < 1e-3 {
+        // Never slowed down: read whole frames, exactly as they were mixed. Once slowed, the
+        // eased path keeps the two frames it has already taken from the queue; snapping back to
+        // the whole-frame path would drop them.
+        if d.target >= 1.0 && (d.speed - 1.0).abs() < 1e-3 && !d.primed {
             d.speed = 1.0;
-            d.phase = 0.0;
-            d.primed = false;
             return false;
         }
         let Ok(mut q) = self.queue.lock() else { return false };
