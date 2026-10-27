@@ -66,6 +66,10 @@ impl EffectcraftApp {
         if self.advance_audio_clock(&pass, step) {
             return;
         }
+        // The sound was given up earlier (a stall, a stream that died, a render too slow): take it
+        // up again from the frame on screen once the picture moves, or a preview that stalled once
+        // would stay silent for the rest of the pass (#947).
+        self.resume_audio(&pass);
         self.advance_frame_clock(&pass, step);
     }
 
@@ -413,12 +417,6 @@ impl EffectcraftApp {
     /// How many viewer frames of `comp` at `scale` the RAM preview budget holds (90 % of it,
     /// at least one).
     /// The frames of `plan` from `cur` to its end, or as many as fit in the RAM preview, are
-    /// cached: sound can play from `cur` in real time.
-    fn cached_ahead(&self, plan: &effectcraft_engine::preview::PreviewPlan, series: &FrameKey, cur: i64, fit: i64) -> bool {
-        let cached = self.frames.cached_frames(series);
-        (0..fit).map_while(|k| plan.frame_after(cur, k)).take_while(|f| *f >= cur).all(|f| cached.binary_search(&f).is_ok())
-    }
-
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
         let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
         let frame = side(comp.width) * side(comp.height) * 4.0;
