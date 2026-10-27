@@ -1655,7 +1655,12 @@ impl EffectcraftApp {
             self.stop();
             return true;
         }
-        if a.stalled(now) || (video && now - self.playback.last_shown > AUDIO_GIVE_UP) {
+        // Whether the frame under the audible sample is there at all: a preview that loops over a
+        // single frame keeps the same frame on screen forever, and that is not a render that fell
+        // behind — only a missing frame is worth giving the sound up for.
+        let audible = audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb);
+        let missing = !self.frames.is_cached(&FrameKey { frame: wa + (audible - wa).div_euclid(step) * step, ..series });
+        if a.stalled(now) || (video && missing && now - self.playback.last_shown > AUDIO_GIVE_UP) {
             // The sound stopped, or the picture has not moved for a while (the renderer cannot keep
             // up even at the slowest speed): fall back to the frame clock from where playback is,
             // instead of freezing the preview or playing on over a still frame (#947). An

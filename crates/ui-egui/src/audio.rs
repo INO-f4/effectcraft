@@ -213,6 +213,11 @@ impl AudioFeed {
         d.cur = cur;
         d.nxt = nxt;
         self.consumed.fetch_add(taken, Ordering::Relaxed);
+        if taken == 0 {
+            // The queue had nothing to give: the dry pull the ordinary path counts too, so the
+            // feeder's lead can also grow for a preview that already slowed down.
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+        }
         drop(q);
         drop(d);
         self.note_peaks(pk);
@@ -766,6 +771,20 @@ mod tests {
         assert!(stall_watch(&mut w, 8.2, 0, false), "5.2 s with nothing to play: stalled");
         // The clock moving keeps it alive at any speed.
         assert!(!stall_watch(&mut w, 8.3, 1600, false));
+    }
+
+    /// The slowed path counts a pull that found nothing, so the lead grows after a slowdown too.
+    #[test]
+    fn a_dry_varispeed_pull_counts_as_an_underrun() {
+        let f = AudioFeed::default();
+        f.set_rate(48_000);
+        f.set_speed(0.5);
+        let mut out = vec![0.0f32; 64];
+        f.pull(&mut out);
+        assert_eq!(f.underruns(), 1, "an empty queue counts like the ordinary path");
+        f.push(&vec![0.1f32; 256]);
+        f.pull(&mut out);
+        assert_eq!(f.underruns(), 1, "a served pull does not");
     }
 
     /// A lead grows while the device runs dry and shrinks back once it is served in time.
