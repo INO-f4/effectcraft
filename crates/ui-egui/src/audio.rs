@@ -71,6 +71,8 @@ pub struct AudioFeed {
     consumed: AtomicU64,
     /// Peak |sample| per channel since the last [`AudioFeed::take_peaks`] (f32 bits).
     peak: [AtomicU32; 2],
+    /// Pulls that ran dry (the device asked for more than the feeder had queued).
+    underruns: AtomicU64,
     /// The feeder reached the end of a non-looping span.
     finished: AtomicBool,
     /// The rate the feed is pulled at (0: not told yet; speed easing is timed by it).
@@ -86,6 +88,7 @@ impl Default for AudioFeed {
             queue: Mutex::default(),
             consumed: AtomicU64::default(),
             peak: [AtomicU32::new(0), AtomicU32::new(0)],
+            underruns: AtomicU64::default(),
             finished: AtomicBool::default(),
             rate: AtomicU32::default(),
             drive: Mutex::default(),
@@ -145,6 +148,9 @@ impl AudioFeed {
             real = n;
         }
         out[real..].iter_mut().for_each(|o| *o = 0.0);
+        if real < out.len() {
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+        }
         self.consumed.fetch_add((real / 2) as u64, Ordering::Relaxed);
         self.note_peaks(pk);
     }
@@ -259,6 +265,11 @@ impl AudioFeed {
         self.queue.lock().map(|q| q.len() / 2).unwrap_or(0)
     }
 
+    /// Pulls that ran dry since the playback started (the feeder was late).
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
     pub fn consumed(&self) -> u64 {
         self.consumed.load(Ordering::Relaxed)
     }
@@ -367,6 +378,39 @@ fn queue_target(rate: u32) -> usize {
     if cfg!(target_arch = "wasm32") { rate as usize * 7 / 20 } else { rate as usize / 10 }
 }
 
+/// How far ahead the feeder keeps the queue: the base lead, grown whenever the device ran dry
+/// (a render pool takes the cores, and the callback is then served late) and given back once the
+/// machine has settled. Pure arithmetic, so it is unit tested.
+struct Lead {
+    base: usize,
+    target: usize,
+    seen: u64,
+    idle: u32,
+}
+
+impl Lead {
+    fn new(base: usize) -> Lead {
+        Lead { base, target: base, seen: 0, idle: 0 }
+    }
+
+    /// Feed the underrun count seen so far and the step to grow by; returns the lead to keep.
+    fn update(&mut self, underruns: u64, step: usize) -> usize {
+        if underruns != self.seen {
+            self.seen = underruns;
+            self.target = (self.target + step.max(1)).min(self.base * 4);
+            self.idle = 0;
+        } else if self.target > self.base {
+            // About a second of a full queue at the loop's 4 ms sleep: give a little back.
+            self.idle += 1;
+            if self.idle >= 250 {
+                self.target = self.target.saturating_sub(step.saturating_mul(4)).max(self.base);
+                self.idle = 0;
+            }
+        }
+        self.target
+    }
+}
+
 impl AudioPlayback {
     /// Start mixing `comp` over `span` into `device`.
     /// `mix_rate`: Settings ▸ Audio ▸ Preview Sample Rate, the rate the comp's audio is mixed
@@ -414,8 +458,11 @@ impl AudioPlayback {
                 .name("ec-audio-feed".into())
                 .spawn(move || {
                     let mut cursor = span.start;
-                    let target = queue_target(rate);
+                    let mut lead = Lead::new(queue_target(rate));
                     while !stop.load(Ordering::Relaxed) {
+                        // A render pool takes the cores: keep a longer lead while the device runs
+                        // dry, and give it back once the machine settles (a crackle is an underrun).
+                        let target = lead.update(feed.underruns(), rate as usize / 20);
                         if feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
                             cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix);
                         } else {
@@ -719,6 +766,29 @@ mod tests {
         assert!(stall_watch(&mut w, 8.2, 0, false), "5.2 s with nothing to play: stalled");
         // The clock moving keeps it alive at any speed.
         assert!(!stall_watch(&mut w, 8.3, 1600, false));
+    }
+
+    /// A lead grows while the device runs dry and shrinks back once it is served in time.
+    #[test]
+    fn the_queue_lead_grows_on_underruns_and_settles_down() {
+        let mut lead = Lead::new(4_800);
+        let step = 2_400;
+        assert_eq!(lead.update(0, step), 4_800, "no underrun: the base lead");
+        assert_eq!(lead.update(1, step), 7_200, "a dry pull adds a step");
+        assert_eq!(lead.update(2, step), 9_600);
+        assert_eq!(lead.update(3, step), 12_000);
+        assert_eq!(lead.update(4, step), 14_400);
+        assert_eq!(lead.update(5, step), 16_800);
+        assert_eq!(lead.update(6, step), 19_200, "four times the base at most");
+        // A second without a dry pull (250 sleeps of 4 ms) gives a little back, then more.
+        for n in 0..249 {
+            assert_eq!(lead.update(6, step), 19_200, "{n}");
+        }
+        assert_eq!(lead.update(6, step), 9_600, "a step-of-four back");
+        for _ in 0..250 {
+            lead.update(6, step);
+        }
+        assert_eq!(lead.update(6, step), 4_800, "and the base after another second");
     }
 
     /// A preview that waits for a frame slows the sound down (#947): it is still there, it just
